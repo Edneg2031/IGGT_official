@@ -102,9 +102,14 @@ def predictions_to_glb(
     elif vis_mode == "rgb":
         images = predictions["images"]
     elif vis_mode == "pca":
-        images = predictions["pca_features"].cpu().numpy()
+        images = predictions["pca_features"]
+        if isinstance(images, torch.Tensor):
+            images = images.cpu().numpy()
     else:
-        AssertionError
+        raise ValueError(f"Unsupported visualization mode: {vis_mode}")
+    images = np.asarray(images)
+    if images.ndim == 5 and images.shape[0] == 1:
+        images = images[0]
     # Use extrinsic matrices instead of pred_extrinsic_list
     camera_matrices = predictions["extrinsic"]
 
@@ -170,7 +175,20 @@ def predictions_to_glb(
         colors_rgb = np.transpose(images, (0, 2, 3, 1))
     else:  # Assume already in NHWC format
         colors_rgb = images
-    colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
+    colors_rgb = colors_rgb.reshape(-1, 3)
+    if (
+        np.issubdtype(colors_rgb.dtype, np.floating)
+        and colors_rgb.size
+        and colors_rgb.max() <= 1.0
+    ):
+        colors_rgb = colors_rgb * 255.0
+    colors_rgb = np.clip(colors_rgb, 0, 255).astype(np.uint8)
+
+    if len(colors_rgb) != len(vertices_3d):
+        raise ValueError(
+            f"Point/color count mismatch for {vis_mode}: "
+            f"{len(vertices_3d)} points vs {len(colors_rgb)} colors"
+        )
 
     conf = pred_world_points_conf.reshape(-1)
     # Convert percentage threshold to actual confidence value

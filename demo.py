@@ -36,6 +36,7 @@ from iggt.models.vggt import VGGT, IGGT
 from iggt.utils.load_fn import load_and_preprocess_images
 from iggt.utils.pose_enc import pose_encoding_to_extri_intri
 from iggt.utils.geometry import unproject_depth_map_to_point_map, depth_to_world_coords_points, closed_form_inverse_se3
+from iggt.utils.pointcloud_io import export_scene_point_cloud
 from iggt.utils.misc import (
     apply_pca_colormap,
     cluster_features_to_masks,
@@ -395,8 +396,9 @@ class IGGTProcessor:
         self._save_dbscan_masks(dbscan_masks, save_dir)
 
         # Update predictions
+        predictions['instance_labels'] = dbscan_masks[0].astype(np.int32)
         predictions['features'] = dbscan_masks[1]
-        predictions['pca_features'] = pred_spatial_pca_masks.unsqueeze(0)
+        predictions['pca_features'] = pred_spatial_pca_masks.cpu().numpy()
 
         return predictions
 
@@ -618,7 +620,7 @@ class IGGTProcessor:
 def export_glb_visualizations(predictions: Dict[str, Any], target_dir: str, save_dir: str,
                             frame_filter: str = "All", conf_thres: float = DEFAULT_CONF_THRESHOLD):
     """
-    Export 3D visualizations in GLB format.
+    Export 3D visualizations in GLB and point-cloud-only PLY formats.
 
     Args:
         predictions: Model predictions dictionary
@@ -655,6 +657,13 @@ def export_glb_visualizations(predictions: Dict[str, Any], target_dir: str, save
         output_path = os.path.join(save_dir, f"{file_prefix}_glbscene_{scene_name}.glb")
         glb_scene.export(file_obj=output_path)
         logger.info(f"{vis_mode.upper()} GLB exported to {output_path}")
+
+        ply_output_path = os.path.join(save_dir, f"{file_prefix}_plyscene_{scene_name}.ply")
+        ply_stats = export_scene_point_cloud(glb_scene, ply_output_path)
+        logger.info(
+            f"{vis_mode.upper()} PLY exported to {ply_output_path} "
+            f"({ply_stats['point_count']} points)"
+        )
 
 
 def main():

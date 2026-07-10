@@ -11,6 +11,8 @@ model = IGGT()
 print("IGGT instantiate ok")
 PY
 
+
+重装 xFormers
 python -m pip uninstall -y xformers
 
 python -m pip install --no-deps \
@@ -18,3 +20,10 @@ python -m pip install --no-deps \
   --index-url https://download.pytorch.org/whl/cu118
 
 python -m xformers.info
+
+python scripts/sample_images.py \
+  /home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames \
+  ./iggt_demo/meeting_room_a02_sample10 \
+  --start 101 \
+  --interval 20 \
+  --count 10

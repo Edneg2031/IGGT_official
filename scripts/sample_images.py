@@ -46,8 +46,15 @@ def find_images(source_dir: Path, recursive: bool) -> list[Path]:
 
 
 def select_images(
-    images: list[Path], count: int, strategy: str, seed: int
+    images: list[Path],
+    count: int,
+    strategy: str,
+    seed: int,
+    interval: int | None = None,
 ) -> list[Path]:
+    if interval is not None:
+        return images[::interval][:count]
+
     sample_count = min(count, len(images))
 
     if strategy == "first":
@@ -91,6 +98,14 @@ def parse_args() -> argparse.Namespace:
         help="1-based position to start sampling from after sorting (default: 1)",
     )
     parser.add_argument(
+        "--interval",
+        type=int,
+        help=(
+            "take one image every N positions starting at --start; "
+            "overrides --strategy"
+        ),
+    )
+    parser.add_argument(
         "--strategy",
         choices=("uniform", "first", "random"),
         default="uniform",
@@ -128,6 +143,9 @@ def main() -> int:
     if args.start <= 0:
         print("error: --start must be greater than zero (the first image is 1)", file=sys.stderr)
         return 2
+    if args.interval is not None and args.interval <= 0:
+        print("error: --interval must be greater than zero", file=sys.stderr)
+        return 2
     if not source_dir.is_dir():
         print(f"error: source directory does not exist: {source_dir}", file=sys.stderr)
         return 2
@@ -152,7 +170,13 @@ def main() -> int:
         return 1
 
     candidate_images = images[args.start - 1 :]
-    selected = select_images(candidate_images, args.count, args.strategy, args.seed)
+    selected = select_images(
+        candidate_images,
+        args.count,
+        args.strategy,
+        args.seed,
+        interval=args.interval,
+    )
     selected_names = [path.name for path in selected]
     duplicate_names = sorted(
         name for name, occurrences in Counter(selected_names).items() if occurrences > 1
@@ -178,16 +202,20 @@ def main() -> int:
         "\n".join(str(path) for path in selected) + "\n", encoding="utf-8"
     )
 
-    if len(candidate_images) < args.count:
+    if len(selected) < args.count:
         print(
-            f"warning: requested {args.count} images, but only {len(candidate_images)} "
-            f"remain from position {args.start}; "
-            f"selected all {len(selected)} images."
+            f"warning: requested {args.count} images, but only {len(selected)} "
+            f"match the requested start/interval range."
         )
 
     print(f"Found:    {len(images)} images")
     print(f"Start:    {args.start} ({candidate_images[0].name})")
-    print(f"Selected: {len(selected)} images ({args.strategy})")
+    if args.interval is not None:
+        print(f"Interval: {args.interval}")
+        sampling_description = f"interval={args.interval}"
+    else:
+        sampling_description = args.strategy
+    print(f"Selected: {len(selected)} images ({sampling_description})")
     print(f"Mode:     {args.mode}")
     print(f"Output:   {images_dir}")
     print(f"Manifest: {manifest_path}")

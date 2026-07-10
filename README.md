@@ -97,9 +97,18 @@ python demo.py
 ```
 
 The script will generate:
-- **3D Visualizations**: `.glb` files for RGB, Mask, and PCA features.
+- **3D Visualizations**: `.glb` and MeshLab-compatible `.ply` files for RGB, Mask, and PCA features.
 - **Depth Maps**: Visualizations with various colormaps in `pred_depths/`.
 - **Segmentation**: DBSCAN and PCA masks in `dbscan_masks/` and `colored_pca/`.
+
+To inspect each clustered instance as a separate point cloud, run:
+
+```bash
+python scripts/export_instances.py path/to/predictions.npz
+```
+
+The script writes `instances/instance_XXXX.ply` files and an `instances.csv`
+manifest next to `predictions.npz`.
 
 <p align="center">
   <img src="./assets/iggt_demo.png" alt="IGGT Demo Example" width="80%">
