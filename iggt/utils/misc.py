@@ -15,11 +15,7 @@ import matplotlib.pyplot as plt
 from sklearn.neighbors import NearestNeighbors
 from torch_geometric.nn import knn_graph
 from torch_scatter import scatter_mean
-
-try:
-    from cuml.cluster.hdbscan import HDBSCAN
-except:
-    from hdbscan import HDBSCAN
+from hdbscan import HDBSCAN
 
 def knn_avg_features_pyg(points_batch, features_batch, k, device='cpu'):
     """
@@ -78,6 +74,192 @@ def knn_avg_features_pyg(points_batch, features_batch, k, device='cpu'):
     return smoothed_features_batch
 
 
+def _labels_to_numpy(labels):
+    """Convert cuML/cuDF/CuPy labels to a host NumPy array."""
+    if hasattr(labels, "compute"):
+        labels = labels.compute()
+    if hasattr(labels, "to_numpy"):
+        labels = labels.to_numpy()
+    elif hasattr(labels, "get"):
+        labels = labels.get()
+    return np.asarray(labels).reshape(-1).astype(np.int32, copy=False)
+
+
+def _cluster_centroids(features, labels):
+    valid_mask = labels >= 0
+    if not valid_mask.any():
+        return np.empty((0,), dtype=np.int32), np.empty(
+            (0, features.shape[1]), dtype=np.float32
+        )
+
+    valid_labels = labels[valid_mask]
+    unique_labels, inverse = np.unique(valid_labels, return_inverse=True)
+    counts = np.bincount(inverse)
+    sums = np.zeros((len(unique_labels), features.shape[1]), dtype=np.float64)
+    np.add.at(sums, inverse, features[valid_mask])
+    centroids = (sums / counts[:, None]).astype(np.float32)
+    return unique_labels.astype(np.int32), centroids
+
+
+def _assign_labels_by_centroid(
+    all_features,
+    fit_features,
+    fit_labels,
+    assignment_chunk_size,
+    initial_labels=None,
+):
+    """Assign unlabeled features to the nearest fitted cluster centroid."""
+    centroid_labels, centroids = _cluster_centroids(fit_features, fit_labels)
+    if len(centroid_labels) == 0:
+        return np.zeros(len(all_features), dtype=np.int32)
+
+    if initial_labels is None:
+        result = np.full(len(all_features), -1, dtype=np.int32)
+    else:
+        result = np.asarray(initial_labels, dtype=np.int32).copy()
+    target_indices = np.flatnonzero(result < 0)
+
+    # Bound the temporary distance matrix to roughly 80 MB.
+    max_chunk_for_centroids = max(1, 20_000_000 // len(centroids))
+    chunk_size = max(1, min(assignment_chunk_size, max_chunk_for_centroids))
+    centroid_norm = np.sum(centroids * centroids, axis=1)
+
+    print(
+        f"Assigning {len(target_indices):,} points from {len(centroids)} cluster "
+        f"centroids in chunks of {chunk_size:,} ..."
+    )
+    for start in range(0, len(target_indices), chunk_size):
+        indices = target_indices[start : start + chunk_size]
+        chunk = all_features[indices]
+        distances = (
+            np.sum(chunk * chunk, axis=1, keepdims=True)
+            + centroid_norm[None]
+            - 2.0 * (chunk @ centroids.T)
+        )
+        result[indices] = centroid_labels[np.argmin(distances, axis=1)]
+    return result
+
+
+def _fit_sampled_hdbscan(
+    all_pixels,
+    eps,
+    min_samples,
+    min_cluster_size,
+    max_cluster_samples,
+    random_state,
+    assignment_chunk_size,
+):
+    total = len(all_pixels)
+    sample_count = min(total, max_cluster_samples)
+    if sample_count < total:
+        rng = np.random.default_rng(random_state)
+        sample_indices = np.sort(
+            rng.choice(total, size=sample_count, replace=False)
+        )
+        fit_pixels = all_pixels[sample_indices]
+    else:
+        sample_indices = None
+        fit_pixels = all_pixels
+
+    sample_ratio = sample_count / total
+    effective_min_samples = max(5, round(min_samples * sample_ratio))
+    effective_min_cluster_size = max(5, round(min_cluster_size * sample_ratio))
+    print(
+        f"CPU sampled HDBSCAN: fitting {sample_count:,}/{total:,} points, "
+        f"min_samples={effective_min_samples}, "
+        f"min_cluster_size={effective_min_cluster_size}"
+    )
+    model = HDBSCAN(
+        cluster_selection_epsilon=eps,
+        min_samples=effective_min_samples,
+        min_cluster_size=effective_min_cluster_size,
+        allow_single_cluster=False,
+        core_dist_n_jobs=-1,
+    ).fit(fit_pixels)
+    fit_labels = _labels_to_numpy(model.labels_)
+
+    if sample_indices is None:
+        all_labels = fit_labels.copy()
+    else:
+        all_labels = np.full(total, -1, dtype=np.int32)
+        valid_sample_mask = fit_labels >= 0
+        all_labels[sample_indices[valid_sample_mask]] = fit_labels[valid_sample_mask]
+    return _assign_labels_by_centroid(
+        all_pixels,
+        fit_pixels,
+        fit_labels,
+        assignment_chunk_size,
+        initial_labels=all_labels,
+    )
+
+
+def _fit_multi_gpu_dbscan(
+    all_pixels,
+    eps,
+    min_samples,
+    min_cluster_size,
+    max_mbytes_per_batch,
+    gpu_count,
+    assignment_chunk_size,
+):
+    from dask.distributed import Client
+    from dask_cuda import LocalCUDACluster
+    from cuml.dask.cluster import DBSCAN as MultiGpuDBSCAN
+
+    visible_gpu_count = torch.cuda.device_count()
+    worker_count = visible_gpu_count if gpu_count is None else min(
+        gpu_count, visible_gpu_count
+    )
+    if worker_count < 2:
+        raise RuntimeError(
+            f"multi-GPU DBSCAN needs at least 2 visible GPUs, found {worker_count}"
+        )
+
+    print(
+        f"Multi-GPU DBSCAN: {len(all_pixels):,} points on {worker_count} GPUs, "
+        f"eps={eps}, min_samples={min_samples}, "
+        f"max_mbytes_per_batch={max_mbytes_per_batch}"
+    )
+    cluster = LocalCUDACluster(
+        n_workers=worker_count,
+        threads_per_worker=1,
+        device_memory_limit=0.9,
+        dashboard_address=None,
+    )
+    client = None
+    try:
+        client = Client(cluster)
+        model = MultiGpuDBSCAN(
+            client=client,
+            eps=eps,
+            min_samples=min_samples,
+            max_mbytes_per_batch=max_mbytes_per_batch,
+            calc_core_sample_indices=False,
+            output_type="numpy",
+        )
+        labels = _labels_to_numpy(model.fit_predict(all_pixels, out_dtype="int32"))
+    finally:
+        if client is not None:
+            client.close()
+        cluster.close()
+
+    # DBSCAN has no min_cluster_size argument, so apply the equivalent filter
+    # before assigning noise/small-cluster pixels to the nearest valid cluster.
+    valid = labels >= 0
+    if valid.any():
+        unique_labels, counts = np.unique(labels[valid], return_counts=True)
+        small_labels = unique_labels[counts < min_cluster_size]
+        if len(small_labels):
+            labels[np.isin(labels, small_labels)] = -1
+    return _assign_labels_by_centroid(
+        all_pixels,
+        all_pixels,
+        labels,
+        assignment_chunk_size,
+        initial_labels=labels,
+    )
+
+
 def cluster_features_to_masks_mv(
     feature_map: Union[torch.Tensor, np.ndarray],
     apply_colormap: bool = False,
@@ -117,35 +299,61 @@ def cluster_features_to_masks_mv(
     else:
         feature_map_np = feature_map
 
-    # 合并所有视图的特征做DBSCAN
-    print(f"对所有视图特征合并后做DBSCAN聚类 (N={n}, H={h}, W={w}, C={c}) ...")
-    all_pixels = feature_map_np.reshape(-1, c)  # (N*H*W, C)
-    hdbscan_cluster = HDBSCAN(
-        cluster_selection_epsilon=kwargs.get("eps"),
-        min_samples=kwargs.get("min_samples"),
-        min_cluster_size=kwargs.get("min_cluster_size"),
-        allow_single_cluster=False,
-    ).fit(all_pixels)
-    all_labels = hdbscan_cluster.labels_  # (N*H*W,)
-    invalid_label_mask = all_labels == -1
+    # 合并所有视图的特征做全局聚类
+    all_pixels = np.ascontiguousarray(
+        feature_map_np.reshape(-1, c), dtype=np.float32
+    )
+    backend = kwargs.get("backend", "sampled_hdbscan")
+    eps = kwargs.get("eps", 0.0)
+    min_samples = kwargs.get("min_samples", 100)
+    min_cluster_size = kwargs.get("min_cluster_size", 500)
+    assignment_chunk_size = kwargs.get("assignment_chunk_size", 100_000)
 
-    # 利用KNN对无效标签(-1)的像素进行掩码分配
-    if invalid_label_mask.sum() > 0:
-        if invalid_label_mask.sum() == len(invalid_label_mask):
-            # 全部为无效点，全部设为0
-            all_labels = np.zeros_like(all_labels)
-        else:
-            valid_pixels = all_pixels[~invalid_label_mask]
-            invalid_pixels = all_pixels[invalid_label_mask]
-            valid_labels = all_labels[~invalid_label_mask]
-            nbrs = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(valid_pixels)
-            distances, indices = nbrs.kneighbors(invalid_pixels)
-            indices = indices[:, 0]
-            all_labels[invalid_label_mask] = valid_labels[indices]
+    print(
+        f"Global clustering (N={n}, H={h}, W={w}, C={c}, "
+        f"points={len(all_pixels):,}, backend={backend}) ..."
+    )
+    if backend == "multi_gpu_dbscan":
+        try:
+            all_labels = _fit_multi_gpu_dbscan(
+                all_pixels,
+                eps,
+                min_samples,
+                min_cluster_size,
+                kwargs.get("max_mbytes_per_batch", 512),
+                kwargs.get("gpu_count"),
+                assignment_chunk_size,
+            )
+        except Exception as exc:
+            print(
+                f"Multi-GPU DBSCAN failed ({type(exc).__name__}: {exc}). "
+                "Falling back to sampled CPU HDBSCAN."
+            )
+            all_labels = _fit_sampled_hdbscan(
+                all_pixels,
+                eps,
+                min_samples,
+                min_cluster_size,
+                kwargs.get("max_cluster_samples", 100_000),
+                kwargs.get("random_state", 0),
+                assignment_chunk_size,
+            )
+    elif backend == "sampled_hdbscan":
+        all_labels = _fit_sampled_hdbscan(
+            all_pixels,
+            eps,
+            min_samples,
+            min_cluster_size,
+            kwargs.get("max_cluster_samples", 100_000),
+            kwargs.get("random_state", 0),
+            assignment_chunk_size,
+        )
+    else:
+        raise ValueError(f"Unsupported clustering backend: {backend}")
 
     # 还原为 (N, H, W)
     masks = all_labels.reshape(n, h, w)
-    print("DBSCAN聚类完成。")
+    print(f"Global clustering completed with {len(np.unique(all_labels))} clusters.")
 
     if not apply_colormap:
         return masks
@@ -153,20 +361,18 @@ def cluster_features_to_masks_mv(
         print("正在应用颜色图...")
         # 全局分配颜色，保证同一label在所有视图中颜色一致
         unique_labels = np.unique(masks)
-        unique_labels_no_noise = unique_labels[unique_labels != -1]
-        n_colors = len(unique_labels_no_noise)
+        n_colors = len(unique_labels)
         cmap = plt.colormaps.get_cmap('jet')
-        color_map = {
-            label: list(cmap(j / (n_colors - 1))[:3]) if n_colors > 1 else list(cmap(0.5)[:3])
-            for j, label in enumerate(unique_labels_no_noise)
-        }
-        color_map[-1] = [0, 0, 0]
-        colored_masks = np.zeros((n, h, w, 3), dtype=np.uint8)
-        for i in range(n):
-            labels = masks[i].reshape(-1)
-            colored_pixels = np.array([color_map[label] for label in labels])
-            colored_pixels_uint8 = (colored_pixels * 255).astype(np.uint8)
-            colored_masks[i] = colored_pixels_uint8.reshape(h, w, 3)
+        color_values = np.array(
+            [
+                cmap(j / (n_colors - 1))[:3]
+                if n_colors > 1
+                else cmap(0.5)[:3]
+                for j in range(n_colors)
+            ]
+        )
+        color_values = (color_values * 255).astype(np.uint8)
+        colored_masks = color_values[np.searchsorted(unique_labels, masks)]
         return masks, colored_masks
     
 

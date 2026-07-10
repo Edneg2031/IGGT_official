@@ -80,7 +80,15 @@ CLUSTERING_CONFIG = {
     'eps': 0.06,
     'min_samples': 100,
     'min_cluster_size': 500,
-    'knn_k': 20
+    'knn_k': 20,
+    # HDBSCAN itself is single-GPU in cuML. Use distributed DBSCAN on all
+    # visible GPUs, with a bounded-memory sampled HDBSCAN fallback.
+    'backend': 'multi_gpu_dbscan',
+    'gpu_count': None,  # None means all GPUs visible to this process.
+    'max_mbytes_per_batch': 512,
+    'max_cluster_samples': 100_000,
+    'assignment_chunk_size': 100_000,
+    'random_state': 0,
 }
 
 class IGGTProcessor:
@@ -178,6 +186,10 @@ class IGGTProcessor:
 
     def _run_inference(self, target_dir: str, save_dir: str) -> Dict[str, Any]:
         """Run model inference on input images."""
+        if next(self.model.parameters()).device.type != torch.device(self.device).type:
+            logger.info(f"Moving IGGT model back to {self.device} for inference...")
+            self.model = self.model.to(self.device)
+
         # Load images
         image_paths = self._get_image_paths(target_dir)
         images = load_and_preprocess_images(
@@ -355,6 +367,18 @@ class IGGTProcessor:
         )
         predictions["world_points_from_depth"] = world_points
 
+        if (
+            CLUSTERING_CONFIG.get('backend') == 'multi_gpu_dbscan'
+            and torch.cuda.is_available()
+            and torch.cuda.device_count() > 1
+        ):
+            logger.info(
+                "Moving IGGT model to CPU before multi-GPU clustering to release "
+                "GPU 0 memory..."
+            )
+            self.model = self.model.to("cpu")
+            torch.cuda.empty_cache()
+
         # Process features and clustering
         predictions = self._process_features_and_clustering(predictions, world_points, save_dir)
 
@@ -390,6 +414,12 @@ class IGGTProcessor:
             eps=CLUSTERING_CONFIG['eps'],
             min_samples=CLUSTERING_CONFIG['min_samples'],
             min_cluster_size=CLUSTERING_CONFIG['min_cluster_size'],
+            backend=CLUSTERING_CONFIG['backend'],
+            gpu_count=CLUSTERING_CONFIG['gpu_count'],
+            max_mbytes_per_batch=CLUSTERING_CONFIG['max_mbytes_per_batch'],
+            max_cluster_samples=CLUSTERING_CONFIG['max_cluster_samples'],
+            assignment_chunk_size=CLUSTERING_CONFIG['assignment_chunk_size'],
+            random_state=CLUSTERING_CONFIG['random_state'],
             apply_colormap=True
         )
 
@@ -410,8 +440,7 @@ class IGGTProcessor:
         N = pca_masks.shape[0]
         for i in range(N):
             color_img = Image.fromarray(
-                (pca_masks[i] * 255).cpu().numpy().astype(np.uint8),
-                mode="RGB"
+                (pca_masks[i] * 255).cpu().numpy().astype(np.uint8)
             )
             color_img.save(os.path.join(output_dir, f"mask_colored_{i:03d}.png"))
 
@@ -426,7 +455,7 @@ class IGGTProcessor:
         N = masks.shape[0]
         for i in range(N):
             # Save colored mask
-            color_img = Image.fromarray(colored_masks[i].astype(np.uint8), mode="RGB")
+            color_img = Image.fromarray(colored_masks[i].astype(np.uint8))
             color_img.save(os.path.join(output_dir, f"mask_colored_{i:03d}.png"))
 
             # Save binary mask

@@ -27,3 +27,6 @@ python scripts/sample_images.py \
   --start 101 \
   --interval 20 \
   --count 10
+
+
+  CUDA_VISIBLE_DEVICES=1,3,5 python demo.py
