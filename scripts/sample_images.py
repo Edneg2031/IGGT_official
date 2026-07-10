@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         help="number of images to sample (default: 10)",
     )
     parser.add_argument(
+        "--start",
+        type=int,
+        default=1,
+        help="1-based position to start sampling from after sorting (default: 1)",
+    )
+    parser.add_argument(
         "--strategy",
         choices=("uniform", "first", "random"),
         default="uniform",
@@ -119,6 +125,9 @@ def main() -> int:
     if args.count <= 0:
         print("error: --count must be greater than zero", file=sys.stderr)
         return 2
+    if args.start <= 0:
+        print("error: --start must be greater than zero (the first image is 1)", file=sys.stderr)
+        return 2
     if not source_dir.is_dir():
         print(f"error: source directory does not exist: {source_dir}", file=sys.stderr)
         return 2
@@ -126,6 +135,12 @@ def main() -> int:
     images = find_images(source_dir, args.recursive)
     if not images:
         print(f"error: no supported images found in: {source_dir}", file=sys.stderr)
+        return 1
+    if args.start > len(images):
+        print(
+            f"error: --start is {args.start}, but only {len(images)} images were found",
+            file=sys.stderr,
+        )
         return 1
 
     if images_dir.exists() and any(images_dir.iterdir()):
@@ -136,7 +151,8 @@ def main() -> int:
         )
         return 1
 
-    selected = select_images(images, args.count, args.strategy, args.seed)
+    candidate_images = images[args.start - 1 :]
+    selected = select_images(candidate_images, args.count, args.strategy, args.seed)
     selected_names = [path.name for path in selected]
     duplicate_names = sorted(
         name for name, occurrences in Counter(selected_names).items() if occurrences > 1
@@ -162,13 +178,15 @@ def main() -> int:
         "\n".join(str(path) for path in selected) + "\n", encoding="utf-8"
     )
 
-    if len(images) < args.count:
+    if len(candidate_images) < args.count:
         print(
-            f"warning: requested {args.count} images, but only {len(images)} were found; "
+            f"warning: requested {args.count} images, but only {len(candidate_images)} "
+            f"remain from position {args.start}; "
             f"selected all {len(selected)} images."
         )
 
     print(f"Found:    {len(images)} images")
+    print(f"Start:    {args.start} ({candidate_images[0].name})")
     print(f"Selected: {len(selected)} images ({args.strategy})")
     print(f"Mode:     {args.mode}")
     print(f"Output:   {images_dir}")
