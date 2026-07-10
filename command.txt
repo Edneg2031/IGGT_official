@@ -1,0 +1,20 @@
+python - <<'PY'
+from iggt.heads import block
+
+print("RMSNorm:", block.RMSNorm)
+print("xFormers enabled:", block.XFORMERS_AVAILABLE)
+
+from iggt.models.vggt import IGGT
+print("IGGT import ok")
+
+model = IGGT()
+print("IGGT instantiate ok")
+PY
+
+python -m pip uninstall -y xformers
+
+python -m pip install --no-deps \
+  xformers==0.0.28.post2 \
+  --index-url https://download.pytorch.org/whl/cu118
+
+python -m xformers.info

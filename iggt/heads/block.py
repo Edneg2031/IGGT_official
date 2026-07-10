@@ -24,20 +24,27 @@ import collections.abc
 try:
     import xformers
     import xformers.ops
+    from xformers import _cpp_lib
     from xformers.ops import memory_efficient_attention
     from xformers.ops import MemoryEfficientAttentionFlashAttentionOp, MemoryEfficientAttentionCutlassOp
     # from xformers.ops import RMSNorm
 
-    XFORMERS_AVAILABLE = True
-except ImportError:
+    # Importing xformers alone can succeed even when its compiled extensions are
+    # incompatible with the installed PyTorch/CUDA/Python versions. In that
+    # case memory_efficient_attention will fail later during the forward pass.
+    XFORMERS_AVAILABLE = _cpp_lib._cpp_library_load_exception is None
+except (ImportError, OSError):
     # logger.warning("xFormers not available")
     print("xFormers not available")
     XFORMERS_AVAILABLE = False
 
 try:
     from apex.normalization import FusedRMSNorm as RMSNorm
-except:
-    from src.model.norm import RMSNorm
+except ImportError:
+    # Apex is an optional CUDA optimization. PyTorch provides a compatible
+    # implementation, so importing IGGT must not depend on an unrelated
+    # top-level ``src`` package that is not part of this repository.
+    RMSNorm = nn.RMSNorm
 
 from pdb import set_trace as st
 
@@ -373,4 +380,3 @@ class PatchEmbed(nn.Module):
     def _init_weights(self):
         w = self.proj.weight.data
         torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1])) 
-
