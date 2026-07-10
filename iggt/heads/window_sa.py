@@ -1,9 +1,15 @@
 import math
 import torch
 import torch.nn as nn
-from basicsr.archs.arch_util import to_2tuple, trunc_normal_
+from torch.nn.init import trunc_normal_
 from einops import rearrange
 from iggt.heads.block import MemEffAttention
+
+
+def to_2tuple(value):
+    if isinstance(value, tuple):
+        return value
+    return (value, value)
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     if drop_prob == 0. or not training:
