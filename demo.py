@@ -662,7 +662,7 @@ def main():
     start_time = time.time()
 
     # Configuration
-    MODEL_PATH = "model path"
+    MODEL_PATH = "/home/wlh50060092/IGGT_official/checkpoints/IGGT_official/iggt_checkpoint.pth"
 
     # Input/Output paths
     TARGET_DIR = "./iggt_demo/demo9"
