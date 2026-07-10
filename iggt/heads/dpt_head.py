@@ -133,7 +133,11 @@ class DPTHead(nn.Module):
         images: torch.Tensor,
         patch_start_idx: int,
         frames_chunk_size: int = 12,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, ...]],
+    ]:
         """
         Forward pass through the DPT head, supports processing by chunking frames.
         Args:
@@ -142,12 +146,12 @@ class DPTHead(nn.Module):
             patch_start_idx (int): Starting index for patch tokens in the token sequence.
                 Used to separate patch tokens from other tokens (e.g., camera or register tokens).
             frames_chunk_size (int, optional): Number of frames to process in each chunk.
-                If None or larger than S, all frames are processed at once. Default: 8.
+                If None or larger than S, all frames are processed at once. Default: 12.
 
         Returns:
-            Tensor or Tuple[Tensor, Tensor]:
-                - If feature_only=True: Feature maps with shape [B, S, C, H, W]
-                - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W]
+            Tracker features, a ``(predictions, confidence)`` tuple, or a
+            ``(predictions, confidence, point_features)`` tuple when
+            ``use_point_feat=True``.
         """
         B, S, _, H, W = images.shape
 
@@ -159,7 +163,7 @@ class DPTHead(nn.Module):
         assert frames_chunk_size > 0
 
         # Process frames in batches
-        all_feats = []
+        all_feats = None
         all_preds = []
         all_conf = []
 
@@ -168,13 +172,22 @@ class DPTHead(nn.Module):
 
             # Process batch of frames
             if self.use_point_feat:
-                # chunk_preds, chunk_conf, chunk_output = self._forward_impl(
                 chunk_preds, chunk_conf, chunk_output = self._forward_impl(
                     aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx, 
                 )
-                # all_preds.append(chunk_preds)
-                # all_conf.append(chunk_conf)
-                all_feats.append(chunk_output)
+                all_preds.append(chunk_preds)
+                all_conf.append(chunk_conf)
+
+                if all_feats is None:
+                    all_feats = [[] for _ in chunk_output]
+                chunk_frames = frames_end_idx - frames_start_idx
+                for level_chunks, level_feat in zip(all_feats, chunk_output):
+                    # scratch_forward features use a flattened B*S dimension.
+                    # Restore B and S here so chunks are merged in the same
+                    # order as the non-chunked path, including when B > 1.
+                    level_chunks.append(
+                        level_feat.reshape(B, chunk_frames, *level_feat.shape[1:])
+                    )
             else:
                 chunk_preds, chunk_conf = self._forward_impl(
                     aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
@@ -184,8 +197,15 @@ class DPTHead(nn.Module):
 
         # Concatenate results along the sequence dimension
         if self.use_point_feat:
-            # return torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1), torch.cat(all_feats, dim=1)
-            return torch.cat(all_feats, dim=1)
+            merged_feats = tuple(
+                torch.cat(level_chunks, dim=1).flatten(0, 1)
+                for level_chunks in all_feats
+            )
+            return (
+                torch.cat(all_preds, dim=1),
+                torch.cat(all_conf, dim=1),
+                merged_feats,
+            )
         else:
             return torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1)
 

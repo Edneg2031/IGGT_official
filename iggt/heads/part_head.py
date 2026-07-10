@@ -106,7 +106,7 @@ class PartHead(DPTHead):
         patch_start_idx: int,
         frames_chunk_size: int = 12,
         point_feature: List[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor:
         """
         Forward pass through the DPT head, supports processing by chunking frames.
         Args:
@@ -115,12 +115,10 @@ class PartHead(DPTHead):
             patch_start_idx (int): Starting index for patch tokens in the token sequence.
                 Used to separate patch tokens from other tokens (e.g., camera or register tokens).
             frames_chunk_size (int, optional): Number of frames to process in each chunk.
-                If None or larger than S, all frames are processed at once. Default: 8.
+                If None or larger than S, all frames are processed at once. Default: 12.
 
         Returns:
-            Tensor or Tuple[Tensor, Tensor]:
-                - If feature_only=True: Feature maps with shape [B, S, C, H, W]
-                - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W]
+            Part feature tensor with shape ``[B, S, C, H, W]``.
         """
         B, S, _, H, W = images.shape
 
@@ -131,19 +129,38 @@ class PartHead(DPTHead):
         # Otherwise, process frames in chunks to manage memory usage
         assert frames_chunk_size > 0
 
-        # Process frames in batches
+        # Process frames in batches. The adaptor and point-head features use a
+        # flattened B*S dimension, so restore it before selecting each chunk.
         all_preds = []
-        all_conf = []
 
         for frames_start_idx in range(0, S, frames_chunk_size):
             frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
-            chunk_preds, chunk_conf = self._forward_impl(
-                aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx,
-                point_feat=point_feature
+            chunk_frames = frames_end_idx - frames_start_idx
+            chunk_images = images[:, frames_start_idx:frames_end_idx].contiguous()
+            chunk_features = [
+                feature.reshape(B, S, *feature.shape[1:])[
+                    :, frames_start_idx:frames_end_idx
+                ].reshape(B * chunk_frames, *feature.shape[1:]).contiguous()
+                for feature in aggregated_tokens_list
+            ]
+            chunk_point_features = (
+                [
+                    feature.reshape(B, S, *feature.shape[1:])[
+                        :, frames_start_idx:frames_end_idx
+                    ].reshape(B * chunk_frames, *feature.shape[1:]).contiguous()
+                    for feature in point_feature
+                ]
+                if point_feature is not None
+                else None
+            )
+            chunk_preds = self._forward_impl(
+                chunk_features,
+                chunk_images,
+                patch_start_idx,
+                point_feat=chunk_point_features,
             )
             all_preds.append(chunk_preds)
-            all_conf.append(chunk_conf)
-        return torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1)
+        return torch.cat(all_preds, dim=1)
 
     def scratch_forward(self, features: List[torch.Tensor], point_feat: List[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -164,6 +181,7 @@ class PartHead(DPTHead):
 
         out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
         del layer_4_rn, layer_4
+        out4 = out
 
         if point_feat is not None:
             out4 = out.flatten(2).permute(0, 2, 1)  # (B, N, C)
@@ -174,6 +192,7 @@ class PartHead(DPTHead):
 
         out = self.scratch.refinenet3(out4, layer_3_rn, size=layer_2_rn.shape[2:])
         del layer_3_rn, layer_3
+        out3 = out
 
         if point_feat is not None:
             out3 = out.flatten(2).permute(0, 2, 1)  # (B, N, C)
@@ -184,6 +203,7 @@ class PartHead(DPTHead):
 
         out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
         del layer_2_rn, layer_2
+        out2 = out
 
         if point_feat is not None:
             # out2 = out.flatten(2).permute(0, 2, 1)  # (B, N, C)
@@ -209,7 +229,7 @@ class PartHead(DPTHead):
             images: torch.Tensor,
             patch_start_idx: int,
             point_feat: List[torch.Tensor] = None,
-        ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        ) -> torch.Tensor:
             B, S, _, H, W = images.shape
             patch_h, patch_w = H // self.patch_size, W // self.patch_size
             out = input
@@ -433,4 +453,3 @@ def custom_interpolate(
         return x.contiguous()
     else:
         return nn.functional.interpolate(x, size=size, mode=mode, align_corners=align_corners)
-

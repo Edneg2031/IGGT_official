@@ -111,7 +111,7 @@ class IGGTProcessor:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
 
-        state_dict = torch.load(model_path, map_location=self.device)
+        state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
         state_dict = align_and_update_state_dicts(logger, model.state_dict(), state_dict)
         model.load_state_dict(state_dict, strict=False)
